@@ -82,6 +82,12 @@ type DockerVolumePayload struct {
 	Labels     map[string]string `json:"Labels"`
 }
 
+type FileBrowserHealth struct {
+	Running bool   `json:"running"`
+	Version string `json:"version,omitempty"`
+	URL     string `json:"url,omitempty"`
+}
+
 func handleError(w http.ResponseWriter, msg string, statusCode int) {
 	log.Println("❌ " + msg)
 	http.Error(w, msg, statusCode)
@@ -177,13 +183,21 @@ func DeleteVolumeHandler(baseDir string) http.HandlerFunc {
 	}
 }
 
-func HealthCheckHandler() http.HandlerFunc {
+func HealthCheckHandler(storageVersion string, getFileBrowserHealth func() FileBrowserHealth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		response := map[string]interface{}{
+			"status":  "ok",
+			"service": "hubfly-storage",
+			"version": storageVersion,
+		}
+
+		if getFileBrowserHealth != nil {
+			response["filebrowser"] = getFileBrowserHealth()
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{
-			"status": "ok",
-		})
+		json.NewEncoder(w).Encode(response)
 	}
 }
 

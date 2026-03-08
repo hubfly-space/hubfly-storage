@@ -39,7 +39,14 @@ func main() {
 
 	http.HandleFunc("/create-volume", handlers.CreateVolumeHandler(baseDir))
 	http.HandleFunc("/delete-volume", handlers.DeleteVolumeHandler(baseDir))
-	http.HandleFunc("/health", handlers.HealthCheckHandler())
+	http.HandleFunc("/health", handlers.HealthCheckHandler(version, func() handlers.FileBrowserHealth {
+		fbHealth := filebrowser.Probe(os.Getenv("FILEBROWSER_URL"))
+		return handlers.FileBrowserHealth{
+			Running: fbHealth.Running,
+			Version: fbHealth.Version,
+			URL:     fbHealth.URL,
+		}
+	}))
 	http.HandleFunc("/volume-stats", handlers.GetVolumeStatsHandler(baseDir))
 	http.HandleFunc("/dev/volumes", handlers.GetVolumesHandler(baseDir))
 	http.HandleFunc("/url-volume/create", handlers.URLVolumeCreateHandler)
