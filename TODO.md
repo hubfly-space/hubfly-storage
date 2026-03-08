@@ -1,0 +1,1 @@
+-c sudo ./filebrowser --port 8872
