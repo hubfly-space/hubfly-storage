@@ -24,7 +24,7 @@ jobs:
 
       - name: Package zip
         run: |
-          zip hubfly-storage-${{ github.ref_name }}-linux-amd64.zip hubfly-storage
+          zip hubfly-storage-linux-amd64.zip hubfly-storage
 
       - name: Create or Update Release
         uses: softprops/action-gh-release@v2
@@ -32,6 +32,6 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
           files: |
-            ./hubfly-storage-${{ github.ref_name }}-linux-amd64.zip
+            ./hubfly-storage-linux-amd64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.PAT }}
