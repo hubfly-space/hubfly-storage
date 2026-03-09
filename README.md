@@ -13,6 +13,7 @@ The service listens on port `8203`.
 - **Dynamic Volume Creation**: Create Docker volumes with a specified size.
 - **Automatic Cleanup**: Automatically removes the `lost+found` directory upon volume creation.
 - **Volume Management**: Delete and list volumes.
+- **Vertical Scale-Up**: Increase existing volume size (no shrinking).
 - **Volume Statistics**: Get detailed statistics for each volume.
 - **Web-based File Access**: Generate temporary URLs for accessing volume data through File Browser.
 
@@ -64,6 +65,31 @@ The service listens on port `8203`.
 - **Success Response:**
     - **Code:** 200 OK
     - **Content:** `{"status": "success", "name": "my-test-volume"}`
+
+### Resize Volume
+- **Endpoint:** `/resize-volume`
+- **Method:** `POST`
+- **Description:** Increases an existing Docker volume size. Shrinking is not supported.
+- **Payload:**
+    ```json
+    {
+      "Name": "my-test-volume",
+      "DriverOpts": {
+        "size": "10G"
+      }
+    }
+    ```
+- **Success Response:**
+    - **Code:** 200 OK
+    - **Content:**
+      ```json
+      {
+        "status": "success",
+        "name": "my-test-volume",
+        "previous_size_bytes": 5368709120,
+        "new_size_bytes": 10737418240
+      }
+      ```
 
 ### Get Volume Stats
 - **Endpoint:** `/volume-stats`
@@ -130,6 +156,7 @@ The service listens on port `8203`.
 - Go 1.17 or later
 - Docker
 - `fallocate`, `mkfs.ext4`, `mount`, `umount`, `df`, `cryptsetup` command-line utilities
+- `resize2fs` and `findmnt` command-line utilities
 - `sudo` access is required for the service to execute system commands.
 
 ### Running the application
@@ -173,6 +200,16 @@ curl http://localhost:8203/dev/volumes
 curl -X POST -H "Content-Type: application/json" -d '{
   "Name": "my-test-volume"
 }' http://localhost:8203/delete-volume
+```
+
+### Resize a volume (scale up only)
+```bash
+curl -X POST -H "Content-Type: application/json" -d '{
+  "Name": "my-test-volume",
+  "DriverOpts": {
+    "size": "10G"
+  }
+}' http://localhost:8203/resize-volume
 ```
 
 ### Check health

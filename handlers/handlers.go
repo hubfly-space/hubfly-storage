@@ -183,6 +183,54 @@ func DeleteVolumeHandler(baseDir string) http.HandlerFunc {
 	}
 }
 
+func ResizeVolumeHandler(baseDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var payload DockerVolumePayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			handleError(w, fmt.Sprintf("Invalid JSON payload: %v", err), http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
+
+		newSize := strings.TrimSpace(payload.DriverOpts["size"])
+		if newSize == "" {
+			handleError(w, "DriverOpts.size is required", http.StatusBadRequest)
+			return
+		}
+
+		log.Printf("Received request to resize volume: %s to %s", payload.Name, newSize)
+
+		previousBytes, updatedBytes, err := volume.ResizeVolume(payload.Name, baseDir, newSize)
+		if err != nil {
+			statusCode := http.StatusInternalServerError
+			if volume.IsValidationError(err) {
+				statusCode = http.StatusBadRequest
+			}
+			handleError(w, fmt.Sprintf("Failed to resize volume: %v", err), statusCode)
+			return
+		}
+
+		stats, statsErr := volume.GetVolumeStats(payload.Name, baseDir)
+		if statsErr != nil {
+			log.Printf("warning: resized volume %s but failed to read stats: %v", payload.Name, statsErr)
+		}
+
+		response := map[string]interface{}{
+			"status":              "success",
+			"name":                payload.Name,
+			"previous_size_bytes": previousBytes,
+			"new_size_bytes":      updatedBytes,
+		}
+		if stats != nil {
+			response["stats"] = stats
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(response)
+	}
+}
+
 func HealthCheckHandler(storageVersion string, getFileBrowserHealth func() FileBrowserHealth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		response := map[string]interface{}{

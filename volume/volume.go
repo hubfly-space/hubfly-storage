@@ -1,11 +1,15 @@
 package volume
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -32,6 +36,25 @@ type VolumeStats struct {
 	Available string `json:"available"`
 	Usage     string `json:"usage"`
 	MountPath string `json:"mount_path"`
+}
+
+var sizePattern = regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)$`)
+
+type ValidationError struct {
+	message string
+}
+
+func (e *ValidationError) Error() string {
+	return e.message
+}
+
+func validationErrorf(format string, args ...interface{}) error {
+	return &ValidationError{message: fmt.Sprintf(format, args...)}
+}
+
+func IsValidationError(err error) bool {
+	var validationErr *ValidationError
+	return errors.As(err, &validationErr)
 }
 
 func runCommand(name string, args ...string) error {
@@ -231,6 +254,68 @@ func DeleteVolume(name, baseDir string) error {
 	return nil
 }
 
+func ResizeVolume(name, baseDir, requestedSize string) (int64, int64, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return 0, 0, validationErrorf("volume name is required")
+	}
+
+	requestedSize = strings.TrimSpace(requestedSize)
+	if requestedSize == "" {
+		return 0, 0, validationErrorf("requested size is required")
+	}
+
+	requestedBytes, err := parseSizeToBytes(requestedSize)
+	if err != nil {
+		return 0, 0, validationErrorf("invalid requested size: %v", err)
+	}
+
+	volumePath := filepath.Join(baseDir, name)
+	dataPath := filepath.Join(volumePath, "_data")
+	imagePath := filepath.Join(volumePath, "volume.img")
+
+	info, err := os.Stat(imagePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, 0, validationErrorf("volume image not found for '%s'", name)
+		}
+		return 0, 0, fmt.Errorf("failed to inspect volume image: %v", err)
+	}
+
+	currentBytes := info.Size()
+	if requestedBytes <= currentBytes {
+		return 0, 0, validationErrorf("new size must be greater than current size (%d bytes); scaling down is not supported", currentBytes)
+	}
+
+	log.Printf("Resizing volume image for %s from %d to %d bytes", name, currentBytes, requestedBytes)
+	if err := runCommand("sudo", "fallocate", "-l", strconv.FormatInt(requestedBytes, 10), imagePath); err != nil {
+		return 0, 0, fmt.Errorf("fallocate failed: %v", err)
+	}
+
+	mapperName := mapperNameForVolume(name)
+	mapperDevice := mapperPath(mapperName)
+	if _, err := os.Stat(mapperDevice); err == nil {
+		log.Printf("Resizing encrypted mapper %s", mapperName)
+		if err := runCommand("sudo", "cryptsetup", "resize", mapperName); err != nil {
+			return currentBytes, requestedBytes, fmt.Errorf("cryptsetup resize failed: %v", err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return currentBytes, requestedBytes, fmt.Errorf("failed to inspect encryption mapper: %v", err)
+	}
+
+	resizeTarget, err := detectResizeTarget(dataPath, mapperDevice, imagePath)
+	if err != nil {
+		return currentBytes, requestedBytes, fmt.Errorf("failed to detect resize target: %v", err)
+	}
+
+	log.Printf("Growing ext4 filesystem for %s using target %s", name, resizeTarget)
+	if err := runCommand("sudo", "resize2fs", resizeTarget); err != nil {
+		return currentBytes, requestedBytes, fmt.Errorf("resize2fs failed after image growth; rerun resize once mount state is healthy: %v", err)
+	}
+
+	return currentBytes, requestedBytes, nil
+}
+
 func setupEncryptedDevice(imagePath, mapperName, key string) error {
 	log.Printf("Creating LUKS2 encrypted device for %s", imagePath)
 	if err := runCommandWithInput(key+"\n", "sudo", "cryptsetup", "-q", "luksFormat", "--type", "luks2", imagePath, "-"); err != nil {
@@ -316,6 +401,88 @@ func mountOptionsForMode(mode OptimizationMode) string {
 		return "relatime,commit=30"
 	default:
 		return "defaults"
+	}
+}
+
+func detectResizeTarget(dataPath, mapperDevice, imagePath string) (string, error) {
+	mountSource, err := mountedSourceForTarget(dataPath)
+	if err == nil && strings.TrimSpace(mountSource) != "" {
+		return strings.TrimSpace(mountSource), nil
+	}
+
+	if _, err := os.Stat(mapperDevice); err == nil {
+		return mapperDevice, nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+
+	return imagePath, nil
+}
+
+func mountedSourceForTarget(target string) (string, error) {
+	output, err := runCommandWithOutput("findmnt", "-n", "-o", "SOURCE", "--target", target)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(output), nil
+}
+
+func parseSizeToBytes(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	matches := sizePattern.FindStringSubmatch(raw)
+	if len(matches) != 3 {
+		return 0, fmt.Errorf("expected format like 10G, 10240M, or bytes")
+	}
+
+	value, err := strconv.ParseFloat(matches[1], 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid numeric value")
+	}
+	if value <= 0 {
+		return 0, fmt.Errorf("size must be greater than zero")
+	}
+
+	multiplier, err := unitMultiplier(matches[2])
+	if err != nil {
+		return 0, err
+	}
+
+	bytesFloat := value * float64(multiplier)
+	maxInt64 := float64(int64(^uint64(0) >> 1))
+	if bytesFloat > maxInt64 {
+		return 0, fmt.Errorf("size is too large")
+	}
+
+	return int64(math.Ceil(bytesFloat)), nil
+}
+
+func unitMultiplier(rawUnit string) (int64, error) {
+	unit := strings.ToLower(strings.TrimSpace(rawUnit))
+	switch unit {
+	case "", "b":
+		return 1, nil
+	case "k", "kb":
+		return 1000, nil
+	case "m", "mb":
+		return 1000 * 1000, nil
+	case "g", "gb":
+		return 1000 * 1000 * 1000, nil
+	case "t", "tb":
+		return 1000 * 1000 * 1000 * 1000, nil
+	case "p", "pb":
+		return 1000 * 1000 * 1000 * 1000 * 1000, nil
+	case "ki", "kib":
+		return 1024, nil
+	case "mi", "mib":
+		return 1024 * 1024, nil
+	case "gi", "gib":
+		return 1024 * 1024 * 1024, nil
+	case "ti", "tib":
+		return 1024 * 1024 * 1024 * 1024, nil
+	case "pi", "pib":
+		return 1024 * 1024 * 1024 * 1024 * 1024, nil
+	default:
+		return 0, fmt.Errorf("unsupported size unit '%s'", rawUnit)
 	}
 }
 
