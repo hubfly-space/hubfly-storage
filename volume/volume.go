@@ -292,6 +292,17 @@ func ResizeVolume(name, baseDir, requestedSize string) (int64, int64, error) {
 		return 0, 0, fmt.Errorf("fallocate failed: %v", err)
 	}
 
+	mountSource, mountErr := mountedSourceForTarget(dataPath)
+	if mountErr != nil {
+		return currentBytes, requestedBytes, fmt.Errorf("failed to resolve mount source: %v", mountErr)
+	}
+	if strings.TrimSpace(mountSource) != "" {
+		log.Printf("Detected mount source for %s: %s", name, strings.TrimSpace(mountSource))
+		if err := refreshLoopDevice(strings.TrimSpace(mountSource)); err != nil {
+			return currentBytes, requestedBytes, fmt.Errorf("failed to refresh loop device: %v", err)
+		}
+	}
+
 	mapperName := mapperNameForVolume(name)
 	mapperDevice := mapperPath(mapperName)
 	if _, err := os.Stat(mapperDevice); err == nil {
@@ -311,6 +322,16 @@ func ResizeVolume(name, baseDir, requestedSize string) (int64, int64, error) {
 	log.Printf("Growing ext4 filesystem for %s using target %s", name, resizeTarget)
 	if err := runCommand("sudo", "resize2fs", resizeTarget); err != nil {
 		return currentBytes, requestedBytes, fmt.Errorf("resize2fs failed after image growth; rerun resize once mount state is healthy: %v", err)
+	}
+
+	if strings.TrimSpace(mountSource) != "" {
+		sizeBytes, err := mountedSizeBytes(dataPath)
+		if err != nil {
+			return currentBytes, requestedBytes, fmt.Errorf("resize verification failed: %v", err)
+		}
+		if !sizeWithinTolerance(sizeBytes, requestedBytes) {
+			return currentBytes, requestedBytes, fmt.Errorf("resize verification failed: filesystem size (%d bytes) is below requested size (%d bytes)", sizeBytes, requestedBytes)
+		}
 	}
 
 	return currentBytes, requestedBytes, nil
@@ -425,6 +446,60 @@ func mountedSourceForTarget(target string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(output), nil
+}
+
+func refreshLoopDevice(mountSource string) error {
+	if strings.HasPrefix(mountSource, "/dev/loop") {
+		log.Printf("Refreshing loop device %s", mountSource)
+		return runCommand("sudo", "losetup", "-c", mountSource)
+	}
+
+	if strings.HasPrefix(mountSource, "/dev/mapper/") {
+		parent, err := runCommandWithOutput("lsblk", "-no", "PKNAME", mountSource)
+		if err != nil {
+			return fmt.Errorf("lsblk failed for %s: %v", mountSource, err)
+		}
+		parent = strings.TrimSpace(parent)
+		if strings.HasPrefix(parent, "loop") {
+			loopPath := filepath.Join("/dev", parent)
+			log.Printf("Refreshing loop device %s backing %s", loopPath, mountSource)
+			return runCommand("sudo", "losetup", "-c", loopPath)
+		}
+	}
+
+	return nil
+}
+
+func mountedSizeBytes(target string) (int64, error) {
+	output, err := runCommandWithOutput("df", "-B1", target)
+	if err != nil {
+		return 0, fmt.Errorf("df -B1 failed: %v", err)
+	}
+	lines := strings.Split(output, "\n")
+	if len(lines) < 2 {
+		return 0, fmt.Errorf("invalid df output")
+	}
+	fields := strings.Fields(lines[1])
+	if len(fields) < 2 {
+		return 0, fmt.Errorf("invalid df output fields")
+	}
+	sizeBytes, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid df size value: %v", err)
+	}
+	return sizeBytes, nil
+}
+
+func sizeWithinTolerance(actualBytes, requestedBytes int64) bool {
+	if actualBytes >= requestedBytes {
+		return true
+	}
+	slack := int64(32 * 1024 * 1024)
+	fivePercent := requestedBytes / 20
+	if fivePercent > slack {
+		slack = fivePercent
+	}
+	return actualBytes+slack >= requestedBytes
 }
 
 func parseSizeToBytes(raw string) (int64, error) {
