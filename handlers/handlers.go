@@ -235,7 +235,7 @@ func ResizeVolumeHandler(baseDir string) http.HandlerFunc {
 func HealthCheckHandler(storageVersion string, getFileBrowserHealth func() FileBrowserHealth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		response := map[string]interface{}{
-			"status":  "ok",
+			"status":  "healthy",
 			"service": "hubfly-storage",
 			"version": storageVersion,
 		}
