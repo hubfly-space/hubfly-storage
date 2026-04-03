@@ -751,7 +751,11 @@ func imagePathUsesLUKS(imagePath string) (bool, error) {
 }
 
 func isVolumeMounted(target string) (bool, string, error) {
-	target = filepath.Clean(target)
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		return false, "", fmt.Errorf("failed to resolve absolute target path: %v", err)
+	}
+	target = filepath.Clean(absTarget)
 
 	mountTarget, err := runCommandWithOutput("findmnt", "-n", "-o", "TARGET", "--target", target)
 	if err != nil {
