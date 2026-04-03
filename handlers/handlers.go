@@ -263,7 +263,11 @@ func GetVolumeStatsHandler(baseDir string) http.HandlerFunc {
 
 		stats, err := volume.GetVolumeStats(payload.Name, baseDir)
 		if err != nil {
-			handleError(w, fmt.Sprintf("Failed to get volume stats: %v", err), http.StatusInternalServerError)
+			statusCode := http.StatusInternalServerError
+			if volume.IsValidationError(err) {
+				statusCode = http.StatusBadRequest
+			}
+			handleError(w, fmt.Sprintf("Failed to get volume stats: %v", err), statusCode)
 			return
 		}
 

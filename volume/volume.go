@@ -36,6 +36,7 @@ type VolumeStats struct {
 	Available string `json:"available"`
 	Usage     string `json:"usage"`
 	MountPath string `json:"mount_path"`
+	Mounted   bool   `json:"mounted"`
 }
 
 var sizePattern = regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)$`)
@@ -565,6 +566,14 @@ func GetVolumeStats(name, baseDir string) (*VolumeStats, error) {
 	volumePath := filepath.Join(baseDir, name)
 	dataPath := filepath.Join(volumePath, "_data")
 
+	isMounted, mountSource, err := isVolumeMounted(dataPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect mount state: %v", err)
+	}
+	if !isMounted {
+		return nil, validationErrorf("volume '%s' is not mounted at %s", name, dataPath)
+	}
+
 	output, err := runCommandWithOutput("df", "-h", dataPath)
 	if err != nil {
 		return nil, fmt.Errorf("df command failed: %v", err)
@@ -587,6 +596,13 @@ func GetVolumeStats(name, baseDir string) (*VolumeStats, error) {
 		Available: formatSize(fields[3]),
 		Usage:     fields[4],
 		MountPath: fields[5],
+		Mounted:   isMounted,
+	}
+	if strings.TrimSpace(fields[0]) != "" {
+		stats.MountPath = fields[5]
+	}
+	if strings.TrimSpace(mountSource) == "" {
+		stats.Mounted = false
 	}
 
 	return stats, nil
@@ -623,4 +639,134 @@ func GetAllVolumes(baseDir string) ([]*VolumeStats, error) {
 	}
 
 	return volumes, nil
+}
+
+func RestoreExistingVolumes(baseDir string) error {
+	files, err := os.ReadDir(baseDir)
+	if err != nil {
+		return fmt.Errorf("failed to read base directory: %v", err)
+	}
+
+	var restoreErrors []string
+	for _, file := range files {
+		if !file.IsDir() {
+			continue
+		}
+
+		name := file.Name()
+		if err := restoreVolumeMount(name, baseDir); err != nil {
+			restoreErrors = append(restoreErrors, fmt.Sprintf("%s: %v", name, err))
+		}
+	}
+
+	if len(restoreErrors) > 0 {
+		return fmt.Errorf("volume restore warnings: %s", strings.Join(restoreErrors, "; "))
+	}
+
+	return nil
+}
+
+func restoreVolumeMount(name, baseDir string) error {
+	volumePath := filepath.Join(baseDir, name)
+	dataPath := filepath.Join(volumePath, "_data")
+	imagePath := filepath.Join(volumePath, "volume.img")
+
+	if _, err := os.Stat(imagePath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to inspect image file: %v", err)
+	}
+
+	if err := os.MkdirAll(dataPath, 0755); err != nil {
+		return fmt.Errorf("failed to ensure data path: %v", err)
+	}
+
+	mounted, source, err := isVolumeMounted(dataPath)
+	if err != nil {
+		return fmt.Errorf("failed to inspect mount state: %v", err)
+	}
+	if mounted {
+		log.Printf("Volume %s already mounted from %s", name, source)
+		return nil
+	}
+
+	mountSource, err := restoreMountSource(name, imagePath)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Restoring volume mount for %s from %s to %s", name, mountSource, dataPath)
+	if err := runCommand("sudo", "mount", mountSource, dataPath); err != nil {
+		return fmt.Errorf("mount restore failed: %v", err)
+	}
+
+	return nil
+}
+
+func restoreMountSource(name, imagePath string) (string, error) {
+	encrypted, err := imagePathUsesLUKS(imagePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to inspect encryption format: %v", err)
+	}
+	if !encrypted {
+		return imagePath, nil
+	}
+
+	mapperName := mapperNameForVolume(name)
+	mapperDevice := mapperPath(mapperName)
+	if _, err := os.Stat(mapperDevice); err == nil {
+		return mapperDevice, nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("failed to inspect mapper device: %v", err)
+	}
+
+	key := strings.TrimSpace(os.Getenv("VOLUME_ENCRYPTION_KEY"))
+	if key == "" {
+		return "", fmt.Errorf("encrypted volume requires VOLUME_ENCRYPTION_KEY to restore after reboot")
+	}
+
+	if err := runCommandWithInput(key+"\n", "sudo", "cryptsetup", "open", imagePath, mapperName, "-"); err != nil {
+		return "", fmt.Errorf("failed to open encrypted volume: %v", err)
+	}
+
+	return mapperDevice, nil
+}
+
+func imagePathUsesLUKS(imagePath string) (bool, error) {
+	cmd := exec.Command("sudo", "cryptsetup", "isLuks", imagePath)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+
+	exitErr := &exec.ExitError{}
+	if errors.As(err, &exitErr) {
+		if exitErr.ExitCode() == 1 {
+			return false, nil
+		}
+	}
+
+	return false, fmt.Errorf("%v: %s", err, strings.TrimSpace(string(output)))
+}
+
+func isVolumeMounted(target string) (bool, string, error) {
+	target = filepath.Clean(target)
+
+	mountTarget, err := runCommandWithOutput("findmnt", "-n", "-o", "TARGET", "--target", target)
+	if err != nil {
+		return false, "", err
+	}
+
+	mountTarget = filepath.Clean(strings.TrimSpace(mountTarget))
+	if mountTarget != target {
+		return false, "", nil
+	}
+
+	mountSource, err := runCommandWithOutput("findmnt", "-n", "-o", "SOURCE", "--target", target)
+	if err != nil {
+		return false, "", err
+	}
+
+	return true, strings.TrimSpace(mountSource), nil
 }

@@ -1,3 +1,4 @@
 hubfly-storage
 !cmd/hubfly-storage
 docker-volumes/
+.env
