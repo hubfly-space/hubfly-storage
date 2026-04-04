@@ -566,12 +566,19 @@ func GetVolumeStats(name, baseDir string) (*VolumeStats, error) {
 	volumePath := filepath.Join(baseDir, name)
 	dataPath := filepath.Join(volumePath, "_data")
 
+	if err := EnsureVolumeReady(name, baseDir); err != nil {
+		return nil, err
+	}
+
 	isMounted, mountSource, err := isVolumeMounted(dataPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to inspect mount state: %v", err)
 	}
 	if !isMounted {
 		return nil, validationErrorf("volume '%s' is not mounted at %s", name, dataPath)
+	}
+	if !isExpectedVolumeMountSource(mountSource) {
+		return nil, validationErrorf("volume '%s' is mounted from unexpected source %q instead of a loop or mapper device", name, mountSource)
 	}
 
 	output, err := runCommandWithOutput("df", "-h", dataPath)
@@ -606,6 +613,23 @@ func GetVolumeStats(name, baseDir string) (*VolumeStats, error) {
 	}
 
 	return stats, nil
+}
+
+func isExpectedVolumeMountSource(source string) bool {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return false
+	}
+
+	if strings.HasPrefix(source, "/dev/loop") {
+		return true
+	}
+
+	if strings.HasPrefix(source, "/dev/mapper/hubfly-") {
+		return true
+	}
+
+	return false
 }
 
 func formatSize(size string) string {
@@ -654,7 +678,7 @@ func RestoreExistingVolumes(baseDir string) error {
 		}
 
 		name := file.Name()
-		if err := restoreVolumeMount(name, baseDir); err != nil {
+		if err := EnsureVolumeReady(name, baseDir); err != nil {
 			restoreErrors = append(restoreErrors, fmt.Sprintf("%s: %v", name, err))
 		}
 	}
@@ -666,42 +690,72 @@ func RestoreExistingVolumes(baseDir string) error {
 	return nil
 }
 
-func restoreVolumeMount(name, baseDir string) error {
+func EnsureVolumeReady(name, baseDir string) error {
+	dataPath, err := ensureHubflyVolumeMount(name, baseDir)
+	if err != nil {
+		return err
+	}
+
+	if err := ensureDockerVolumeBindMount(name, dataPath); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func ensureHubflyVolumeMount(name, baseDir string) (string, error) {
 	volumePath := filepath.Join(baseDir, name)
 	dataPath := filepath.Join(volumePath, "_data")
 	imagePath := filepath.Join(volumePath, "volume.img")
 
 	if _, err := os.Stat(imagePath); err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return "", validationErrorf("volume image not found for '%s'", name)
 		}
-		return fmt.Errorf("failed to inspect image file: %v", err)
+		return "", fmt.Errorf("failed to inspect image file: %v", err)
 	}
 
 	if err := os.MkdirAll(dataPath, 0755); err != nil {
-		return fmt.Errorf("failed to ensure data path: %v", err)
+		return "", fmt.Errorf("failed to ensure data path: %v", err)
 	}
 
 	mounted, source, err := isVolumeMounted(dataPath)
 	if err != nil {
-		return fmt.Errorf("failed to inspect mount state: %v", err)
+		return "", fmt.Errorf("failed to inspect mount state: %v", err)
+	}
+	if mounted && isExpectedVolumeMountSource(source) {
+		log.Printf("Volume %s already mounted from %s", name, source)
+		return dataPath, nil
 	}
 	if mounted {
-		log.Printf("Volume %s already mounted from %s", name, source)
-		return nil
+		log.Printf("Volume %s mounted from unexpected source %s; attempting repair", name, source)
+		if err := runCommand("sudo", "umount", dataPath); err != nil {
+			log.Printf("warning: failed to unmount drifted mount at %s: %v; retrying with lazy unmount", dataPath, err)
+			if lazyErr := runCommand("sudo", "umount", "-l", dataPath); lazyErr != nil {
+				return "", fmt.Errorf("failed to unmount drifted mount at %s: %v", dataPath, lazyErr)
+			}
+		}
 	}
 
 	mountSource, err := restoreMountSource(name, imagePath)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	log.Printf("Restoring volume mount for %s from %s to %s", name, mountSource, dataPath)
 	if err := runCommand("sudo", "mount", mountSource, dataPath); err != nil {
-		return fmt.Errorf("mount restore failed: %v", err)
+		return "", fmt.Errorf("mount restore failed: %v", err)
 	}
 
-	return nil
+	verified, verifiedSource, err := isVolumeMounted(dataPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to verify restored mount: %v", err)
+	}
+	if !verified || !isExpectedVolumeMountSource(verifiedSource) {
+		return "", fmt.Errorf("restored mount for %s is still invalid: %q", name, verifiedSource)
+	}
+
+	return dataPath, nil
 }
 
 func restoreMountSource(name, imagePath string) (string, error) {
@@ -773,4 +827,63 @@ func isVolumeMounted(target string) (bool, string, error) {
 	}
 
 	return true, strings.TrimSpace(mountSource), nil
+}
+
+func ensureDockerVolumeBindMount(name, sourcePath string) error {
+	mountpoint, err := dockerVolumeMountpoint(name)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(mountpoint) == "" {
+		return nil
+	}
+
+	if err := os.MkdirAll(mountpoint, 0755); err != nil {
+		return fmt.Errorf("failed to ensure docker mountpoint %s: %v", mountpoint, err)
+	}
+
+	mounted, currentSource, err := isVolumeMounted(mountpoint)
+	if err != nil {
+		return fmt.Errorf("failed to inspect docker mountpoint %s: %v", mountpoint, err)
+	}
+	if mounted && isExpectedVolumeMountSource(currentSource) {
+		log.Printf("Docker volume %s already points at %s", name, currentSource)
+		return nil
+	}
+	if mounted {
+		log.Printf("Docker volume %s mounted from unexpected source %s; attempting repair", name, currentSource)
+		if err := runCommand("sudo", "umount", mountpoint); err != nil {
+			log.Printf("warning: failed to unmount docker mountpoint %s: %v; retrying with lazy unmount", mountpoint, err)
+			if lazyErr := runCommand("sudo", "umount", "-l", mountpoint); lazyErr != nil {
+				return fmt.Errorf("failed to unmount docker mountpoint %s: %v", mountpoint, lazyErr)
+			}
+		}
+	}
+
+	log.Printf("Binding docker volume %s mountpoint %s to %s", name, mountpoint, sourcePath)
+	if err := runCommand("sudo", "mount", "--bind", sourcePath, mountpoint); err != nil {
+		return fmt.Errorf("failed to bind docker mountpoint %s to %s: %v", mountpoint, sourcePath, err)
+	}
+
+	verified, verifiedSource, err := isVolumeMounted(mountpoint)
+	if err != nil {
+		return fmt.Errorf("failed to verify docker mountpoint %s: %v", mountpoint, err)
+	}
+	if !verified || !isExpectedVolumeMountSource(verifiedSource) {
+		return fmt.Errorf("docker mountpoint %s still has unexpected source %q after repair", mountpoint, verifiedSource)
+	}
+
+	return nil
+}
+
+func dockerVolumeMountpoint(name string) (string, error) {
+	output, err := runCommandWithOutput("docker", "volume", "inspect", "--format", "{{.Mountpoint}}", name)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such volume") {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to inspect docker volume %s: %v", name, err)
+	}
+
+	return strings.TrimSpace(output), nil
 }
