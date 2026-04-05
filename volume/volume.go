@@ -566,10 +566,6 @@ func GetVolumeStats(name, baseDir string) (*VolumeStats, error) {
 	volumePath := filepath.Join(baseDir, name)
 	dataPath := filepath.Join(volumePath, "_data")
 
-	if err := EnsureHubflyVolumeReady(name, baseDir); err != nil {
-		return nil, err
-	}
-
 	isMounted, mountSource, err := isVolumeMounted(dataPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to inspect mount state: %v", err)
@@ -663,31 +659,6 @@ func GetAllVolumes(baseDir string) ([]*VolumeStats, error) {
 	}
 
 	return volumes, nil
-}
-
-func RestoreExistingVolumes(baseDir string) error {
-	files, err := os.ReadDir(baseDir)
-	if err != nil {
-		return fmt.Errorf("failed to read base directory: %v", err)
-	}
-
-	var restoreErrors []string
-	for _, file := range files {
-		if !file.IsDir() {
-			continue
-		}
-
-		name := file.Name()
-		if err := EnsureHubflyVolumeReady(name, baseDir); err != nil {
-			restoreErrors = append(restoreErrors, fmt.Sprintf("%s: %v", name, err))
-		}
-	}
-
-	if len(restoreErrors) > 0 {
-		return fmt.Errorf("volume restore warnings: %s", strings.Join(restoreErrors, "; "))
-	}
-
-	return nil
 }
 
 func EnsureHubflyVolumeReady(name, baseDir string) error {
