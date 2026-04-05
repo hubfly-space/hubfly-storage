@@ -566,7 +566,7 @@ func GetVolumeStats(name, baseDir string) (*VolumeStats, error) {
 	volumePath := filepath.Join(baseDir, name)
 	dataPath := filepath.Join(volumePath, "_data")
 
-	if err := EnsureVolumeReady(name, baseDir); err != nil {
+	if err := EnsureHubflyVolumeReady(name, baseDir); err != nil {
 		return nil, err
 	}
 
@@ -678,7 +678,7 @@ func RestoreExistingVolumes(baseDir string) error {
 		}
 
 		name := file.Name()
-		if err := EnsureVolumeReady(name, baseDir); err != nil {
+		if err := EnsureHubflyVolumeReady(name, baseDir); err != nil {
 			restoreErrors = append(restoreErrors, fmt.Sprintf("%s: %v", name, err))
 		}
 	}
@@ -690,17 +690,9 @@ func RestoreExistingVolumes(baseDir string) error {
 	return nil
 }
 
-func EnsureVolumeReady(name, baseDir string) error {
-	dataPath, err := ensureHubflyVolumeMount(name, baseDir)
-	if err != nil {
-		return err
-	}
-
-	if err := ensureDockerVolumeBindMount(name, dataPath); err != nil {
-		return err
-	}
-
-	return nil
+func EnsureHubflyVolumeReady(name, baseDir string) error {
+	_, err := ensureHubflyVolumeMount(name, baseDir)
+	return err
 }
 
 func ensureHubflyVolumeMount(name, baseDir string) (string, error) {

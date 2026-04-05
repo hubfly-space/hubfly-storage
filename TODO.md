@@ -1,1 +1,6 @@
+- [ ] Add an explicit maintenance-only repair flow for Docker volume mountpoints.
+- [ ] Keep normal runtime behavior limited to restoring Hubfly-owned mounts only.
+- [ ] Expose the repair flow as either `hubfly-storage repair-docker-mounts` or a maintenance-only HTTP endpoint.
+- [ ] Require Docker to be stopped before running Docker mountpoint repair.
+- [ ] Add clear verification/logging for repaired volumes and drifted volumes that still need manual intervention.
 -c sudo ./filebrowser --port 8872
